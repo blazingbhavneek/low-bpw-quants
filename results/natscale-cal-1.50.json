@@ -1,0 +1,8 @@
+{
+  "predictions": 8192,
+  "kl": 0.3590657111810319,
+  "top1": 0.77978515625,
+  "teacher_ppl": 6.2879952817820515,
+  "ppl": 8.270908734370664,
+  "bank": "artifacts/natscale-cal-1.50.gguf"
+}

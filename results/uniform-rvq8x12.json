@@ -1,0 +1,8 @@
+{
+  "predictions": 8192,
+  "kl": 0.4531236848514724,
+  "top1": 0.7386474609375,
+  "teacher_ppl": 6.2879952817820515,
+  "ppl": 9.000280805820768,
+  "bank": "artifacts/uniform-rvq8x12.gguf"
+}

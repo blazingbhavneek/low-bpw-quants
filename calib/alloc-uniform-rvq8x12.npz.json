@@ -1,0 +1,22 @@
+{
+  "output": "calib/alloc-uniform-rvq8x12.npz",
+  "payload_bpw": 1.5157470703125,
+  "beta": null,
+  "objective": "natscale",
+  "pool": "mean",
+  "drop": [],
+  "use": {
+    "rvq8x12": 1.0
+  },
+  "per_projection_use": {
+    "gate": [
+      10240
+    ],
+    "up": [
+      10240
+    ],
+    "down": [
+      10240
+    ]
+  }
+}

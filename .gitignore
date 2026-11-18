@@ -1,0 +1,26 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Local research checkouts and generated banks
+/research/GSQ/
+/research/RCO/
+*.gguf
+*.gguf.*.partial
+calib/
+
+# Local checkpoints, banks and the work llama.cpp copy (kernels live in the fork's inkling2-rvq branch)
+/nvidia/
+/artifacts/
+/llama.cpp/
+/llama_diff.txt
+/handoff_llama.md
+/results/chain*.log
+/results/tune-t*.log

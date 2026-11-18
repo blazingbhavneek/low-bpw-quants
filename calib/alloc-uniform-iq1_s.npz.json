@@ -1,0 +1,20 @@
+{
+  "output": "calib/alloc-uniform-iq1_s.npz",
+  "payload_bpw": 1.56256103515625,
+  "beta": null,
+  "objective": "natscale",
+  "use": {
+    "iq1_s": 1.0
+  },
+  "per_projection_use": {
+    "gate": [
+      10240
+    ],
+    "up": [
+      10240
+    ],
+    "down": [
+      10240
+    ]
+  }
+}

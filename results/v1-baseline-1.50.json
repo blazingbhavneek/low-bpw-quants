@@ -1,0 +1,8 @@
+{
+  "predictions": 8192,
+  "kl": 1.0936014238622538,
+  "top1": 0.6080322265625,
+  "teacher_ppl": 6.2879952817820515,
+  "ppl": 16.506174316455365,
+  "bank": "artifacts/Qwen3.6-35B-A3B-routed-1.50bpw.gguf"
+}
