@@ -122,12 +122,15 @@ def objective_terms(source, scores: Path, gradients: Path, contrast: float, obje
     bpw = layers[0]["bits"]
     ref = np.median(np.concatenate([s["alpha"] for s in layers]))
     allowed = [k for k, n in enumerate(names) if n not in drop]
+    zero = [k for k, n in enumerate(names) if n == "zero"]
     terms, combos = [], None
     for l, score in enumerate(layers):
         err, cost, combos = expert_terms(score, tied, 1.0 if objective == "fisher" else 0.5, pool, allowed)
         d = weights[l][:, None] * err
         if prior:
-            A = ((ref / score["alpha"]) * score["variance"]) @ (2.0 ** (-2 * bpw[combos])).T / 3  # [E, C]
+            b = bpw[combos]
+            b[np.isin(combos, zero).any(1)] = 0  # a zeroed projection zeroes the whole expert output
+            A = ((ref / score["alpha"]) * score["variance"]) @ (2.0 ** (-2 * b)).T / 3  # [E, C]
             d = d * A
         terms.append((d, cost))
     return terms, combos, names, beta

@@ -7,6 +7,8 @@ next-token predictions of each window are scored (8,192 predictions).
 from __future__ import annotations
 
 import json
+import os
+import types
 from pathlib import Path
 
 import numpy as np
@@ -57,6 +59,16 @@ def compare(model, teacher: torch.Tensor, student: torch.Tensor, tokens: torch.T
             "teacher_ppl": float(np.exp(nll_t / n)), "ppl": float(np.exp(nll_s / n))}
 
 
+def mask_router(gate, dropped: torch.Tensor):
+    """Top-k router that never selects `dropped` experts (bool [E]); weights renormalize over the rest."""
+    def forward(self, hidden_states):
+        logits = F.linear(hidden_states.reshape(-1, self.hidden_dim), self.weight)
+        probs = torch.softmax(logits.float().masked_fill(dropped, float("-inf")), dim=-1)
+        top, idx = torch.topk(probs, self.top_k, dim=-1)
+        return logits, (top / top.sum(-1, keepdim=True)).to(logits.dtype), idx
+    gate.forward = types.MethodType(forward, gate)
+
+
 def run(source, bank_path: Path | None, parquet: Path, device: str, teacher_cache: Path,
         output: Path | None = None) -> dict:
     from transformers import AutoTokenizer
@@ -73,10 +85,16 @@ def run(source, bank_path: Path | None, parquet: Path, device: str, teacher_cach
                 raise ValueError(f"{teacher_cache} was computed for different windows")
             teacher = cached["hidden"]
         else:
+            from .runtime import DENSE_BITS
+            if DENSE_BITS:
+                raise ValueError("build the teacher cache without LOW_BPW_DENSE_BITS")
             teacher = final_hidden(model, tokens, device)
             torch.save({"tokens": tokens, "hidden": teacher}, teacher_cache)
-        if bank_path is None:
+        from .runtime import DENSE_BITS
+        if bank_path is None and not DENSE_BITS:
             student = teacher
+        elif bank_path is None:
+            student = final_hidden(model, tokens, device)  # dense-only quantization, original experts
         else:
             from .bank import ExpertBank
 
@@ -85,6 +103,10 @@ def run(source, bank_path: Path | None, parquet: Path, device: str, teacher_cach
             load = LayerCache(lambda layer: bank.layer(layer, device))
             for block in model.model.layers:
                 block.mlp.experts.load = load
+            if os.environ.get("LOW_BPW_MASK_DROPPED") and "zero" in bank.formats:
+                z = bank.formats.index("zero")  # fully dropped experts leave top-k: tokens go to the next expert
+                for layer, block in enumerate(model.model.layers):
+                    mask_router(block.mlp.gate, torch.from_numpy((bank.choice[layer] == z).all(-1)).to(device))
             student = final_hidden(model, tokens, device)
         metrics = compare(model, teacher, student, tokens)
     metrics["bank"] = str(bank_path) if bank_path else None

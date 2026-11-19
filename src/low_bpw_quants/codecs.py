@@ -876,6 +876,193 @@ class VQ:
 
 
 # ---------------------------------------------------------------------------------------------
+# Bit-shift trellis-coded quantization (QTIP-style). The state is the last L bits of the code
+# stream; each step shifts in kV bits and emits LUT[state] (V dims), so decode is a sliding
+# window over the bits (random access). Viterbi finds the MSE-optimal path per tile.
+
+_VIT = {}
+
+
+def _viterbi_kernels():
+    if _VIT:
+        return _VIT
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def fwd(X, LUT, BP, END, T, S: tl.constexpr, P: tl.constexpr, V: tl.constexpr):
+        pid = tl.program_id(0).to(tl.int64)
+        s = tl.arange(0, S)
+        x0 = X + pid * T * V
+        cost = tl.zeros([S], tl.float32)
+        for j in tl.static_range(V):
+            e0 = tl.load(x0 + j) - tl.load(LUT + j * S + s)
+            cost += e0 * e0
+        for t in range(1, T):
+            d = tl.zeros([S], tl.float32)
+            for j in tl.static_range(V):
+                e = tl.load(x0 + t * V + j) - tl.load(LUT + j * S + s)
+                d += e * e
+            c2 = tl.reshape(cost, (P, S // P))
+            m = tl.min(c2, 0)
+            a = tl.argmin(c2, 0)
+            tl.store(BP + (pid * T + t) * (S // P) + tl.arange(0, S // P), a.to(tl.uint8))
+            cost = tl.reshape(tl.broadcast_to(m[:, None], (S // P, P)), (S,)) + d
+        tl.store(END + pid, tl.argmin(cost, 0).to(tl.int32))
+
+    @triton.jit
+    def back(BP, END, OUT, T, SP: tl.constexpr, SH: tl.constexpr, KV: tl.constexpr):
+        pid = tl.program_id(0).to(tl.int64)
+        s = tl.load(END + pid)
+        for i in range(T):
+            t = T - 1 - i
+            tl.store(OUT + pid * T + t, s)
+            top = tl.load(BP + (pid * T + t) * SP + (s >> KV)).to(tl.int32)
+            s = (s >> KV) | (top << SH)
+
+    _VIT.update(fwd=fwd, back=back)
+    return _VIT
+
+
+def viterbi(x: torch.Tensor, lut: torch.Tensor, L: int, kV: int) -> torch.Tensor:
+    """x [N, T, V] -> MSE-optimal state sequence [N, T] (int64) of the bit-shift trellis."""
+    k = _viterbi_kernels()
+    N, T, V = x.shape
+    S, P = 1 << L, 1 << kV
+    x = x.float().contiguous()
+    lut = lut.float().T.contiguous()  # [V, S]: coalesced per-component loads
+    out = torch.empty(N, T, dtype=torch.int32, device=x.device)
+    chunk = max(1, (1 << 28) // (T * S // P))  # backpointer buffer <= 256 MiB
+    for a in range(0, N, chunk):
+        n = min(chunk, N - a)
+        bp = torch.empty(n, T, S // P, dtype=torch.uint8, device=x.device)
+        end = torch.empty(n, dtype=torch.int32, device=x.device)
+        k["fwd"][(n,)](x[a:a + n], lut, bp, end, T, S=S, P=P, V=V, num_warps=4 if L <= 12 else 8 if L <= 13 else 16 if L <= 14 else 32)
+        k["back"][(n,)](bp, end, out[a:a + n], T, SP=S // P, SH=L - kV, KV=kV, num_warps=1)
+    return out.long()
+
+
+def trellis_lut(V: int, kV: int, L: int, device) -> torch.Tensor:
+    """Universal LUT for N(0, I) trained by alternating Viterbi and centroid updates; cached."""
+    key = ("tcq", V, kV, L)
+    if key not in CODEBOOKS:
+        path = Path(os.environ.get("LOW_BPW_CACHE", Path.home() / ".cache/low_bpw_quants")) / f"tcq{V}x{kV}l{L}.pt"
+        if path.is_file():
+            CODEBOOKS[key] = torch.load(path)
+        else:
+            dev = "cuda"
+            gen = torch.Generator(device=dev).manual_seed(1000 + L * 16 + kV)
+            S = 1 << L
+            x = torch.randn(max(256, S // 8), 512, V, generator=gen, device=dev)  # ~>=256 visits/state
+            lut = torch.randn(S, V, generator=gen, device=dev)
+            for _ in range(12):
+                st = viterbi(x, lut, L, kV).flatten()
+                sums = torch.zeros_like(lut).index_add_(0, st, x.reshape(-1, V))
+                cnt = torch.bincount(st, minlength=S)[:, None]
+                lut = torch.where(cnt > 0, sums / cnt.clamp_min(1), lut)
+            CODEBOOKS[key] = lut.half().cpu()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(CODEBOOKS[key], path)
+    return CODEBOOKS[key].to(device).float()
+
+
+def _tiles(X, R, V):  # [B, rows, g] -> [B*rows/R, R*g/V, V], row-major inside each R x g tile
+    B, rows, g = X.shape
+    return X.reshape(B * rows // R, R * g // V, V)
+
+
+@dataclass(frozen=True)
+class Trellis:
+    """Bit-shift trellis on a universal Gaussian LUT, per-row FP16 scale, LDLQ feedback between
+    `g`-column groups; each group is cut into R-row tiles, one trellis sequence per tile."""
+    V: int = 2
+    kV: int = 3
+    L: int = 12
+    g: int = 16
+    R: int = 64
+    code = 9
+    block = 128
+
+    @property
+    def name(self):
+        return f"tcq{self.V}x{self.kV}l{self.L}" + (f"r{self.R}" if self.R != 64 else "")
+
+    @property
+    def bpw(self):
+        return self.kV / self.V
+
+    def tile_bytes(self):
+        T = self.R * self.g // self.V
+        return -(-(self.L + (T - 1) * self.kV) // 8)
+
+    def nbytes(self, shape):
+        rows, cols = shape
+        return HEADER + 2 * rows + (cols // self.g) * (rows // self.R) * self.tile_bytes()
+
+    def quantize(self, W, H, **_):
+        B, rows, cols = W.shape
+        lut = trellis_lut(self.V, self.kV, self.L, W.device)
+        W0 = W.float()
+        W = W0.clone()
+        U = None if H is None else hessian_inverse(H)
+        if U is not None:
+            W.masked_fill_((H.diagonal(dim1=-2, dim2=-1) == 0)[:, None, :], 0)
+        s = f16(W.square().mean(-1).sqrt())
+        safe = torch.where(s > 0, s, 1.0)[..., None]
+        states = []
+        unit = torch.empty_like(W)
+        for i1 in range(0, cols, self.block):
+            i2 = min(cols, i1 + self.block)
+            W1 = W[..., i1:i2].clone()
+            Err = torch.zeros_like(W1)
+            for j in range(0, i2 - i1, self.g):
+                J = slice(i1 + j, i1 + j + self.g)
+                st = viterbi(_tiles(W1[..., j:j + self.g] / safe, self.R, self.V), lut, self.L, self.kV)
+                states.append(st.reshape(B, rows // self.R, -1))
+                unit[..., J] = lut[st].reshape(B, rows, self.g)
+                Q = unit[..., J] * s[..., None]
+                if U is not None:  # codes are fixed per group, so the column-by-column LDLQ loop is one triangular solve
+                    a, b = i1 + j, i1 + j + self.g
+                    err = torch.linalg.solve_triangular(U[:, a:b, a:b], W1[..., j:j + self.g] - Q, upper=True, left=False)
+                    W1[..., j + self.g:] -= err @ U[:, a:b, b:i2]
+                    Err[..., j:j + self.g] = err
+            if U is not None:
+                W[..., i2:] -= Err @ U[:, i1:i2, i2:]
+        Hf = None if H is None else H.float()
+        weighted = unit if Hf is None else unit @ Hf
+        num, den = (W0 * weighted).sum(-1), (unit * weighted).sum(-1)
+        s = torch.where((den > 0) & (s > 0), f16(num / den.clamp_min(1e-30)), s)
+        Q = unit * s[..., None]
+        st = torch.stack(states, 1)  # [B, groups, tiles, T]
+        first = (st[..., :1] >> torch.arange(self.L - 1, -1, -1, device=W.device)) & 1
+        rest = (st[..., 1:, None] >> torch.arange(self.kV - 1, -1, -1, device=W.device)) & 1
+        bits = torch.cat((first, rest.flatten(-2)), -1)
+        bits = F.pad(bits, (0, -bits.shape[-1] % 8)).reshape(*bits.shape[:-1], -1, 8)
+        packed = (bits << torch.arange(7, -1, -1, device=W.device)).sum(-1).to(torch.uint8)
+        out = []
+        for b in range(B):
+            body = torch.cat((f16_bytes(s[b][:, None]).reshape(-1), packed[b].reshape(-1)))
+            out.append(torch.cat((header(self.code, (self.V, self.kV, self.L, self.g, self.R // 16), W.device), body)).cpu())
+        return Q, out
+
+    @staticmethod
+    def decode(raw, shape):
+        rows, cols = shape
+        V, kV, L, g, R = (int(v) for v in raw[1:6])
+        R *= 16
+        s = bytes_f16(raw[HEADER:HEADER + 2 * rows])
+        T = R * g // V
+        tb = -(-(L + (T - 1) * kV) // 8)
+        packed = raw[HEADER + 2 * rows:].reshape(cols // g, rows // R, tb).long()
+        bits = ((packed[..., None] >> torch.arange(7, -1, -1, device=raw.device)) & 1).flatten(-2)
+        win = bits[..., :L + (T - 1) * kV].unfold(-1, L, kV)  # [groups, tiles, T, L]
+        st = (win << torch.arange(L - 1, -1, -1, device=raw.device)).sum(-1)
+        vals = trellis_lut(V, kV, L, raw.device)[st]  # [groups, tiles, T, V]
+        unit = vals.reshape(cols // g, rows, g).permute(1, 0, 2).reshape(rows, cols)
+        return unit * s[:, None]
+
+
+# ---------------------------------------------------------------------------------------------
 # Failed-baseline controls (Hessian-free).
 
 
@@ -947,7 +1134,22 @@ class Scalar128(Control):
 
 # ---------------------------------------------------------------------------------------------
 
-BY_CODE = {1: Scalar, 2: Sage, 3: Binary256, 4: Scalar128, 5: Split, 6: GGML, 7: Rotated, 8: VQ}
+class Zero(Control):
+    """0 bpw: the projection is dropped (decodes to zeros), so the expert's output is zero."""
+    name, code, bpw = "zero", 10, 0.0
+
+    def nbytes(self, shape):
+        return HEADER
+
+    def encode(self, W):
+        return header(self.code, (), W.device)
+
+    @staticmethod
+    def decode(raw, shape):
+        return torch.zeros(shape, device=raw.device)
+
+
+BY_CODE = {1: Scalar, 2: Sage, 3: Binary256, 4: Scalar128, 5: Split, 6: GGML, 7: Rotated, 8: VQ, 9: Trellis, 10: Zero}
 CATALOG = [Scalar(2, 128), Scalar(2, 128, True), Scalar(2, 64, True), Scalar(3, 128), Scalar(3, 128, True), Scalar(4, 128), Sage(cap=0), Sage(cap=2), Sage(cap=4),
            Sage(cap=0, graph=False), Sage(cap=2, graph=False),
            Split(64), Split(128), Split(256), Split(128, Scalar(2, 64)), Split(256, Scalar(2, 64)),
@@ -956,7 +1158,10 @@ CATALOG = [Scalar(2, 128), Scalar(2, 128, True), Scalar(2, 64, True), Scalar(3, 
            *[VQ(8, b) for b in (8, 10, 12, 14, 16)], *[Rotated(VQ(8, b)) for b in (4, 6, 8, 10, 12, 14, 16)],
            Rotated(VQ(4, 8)), Rotated(VQ(4, 10)), Rotated(VQ(4, 12)), Rotated(VQ(8, 8, 2)), Rotated(VQ(8, 12, 1)),
            Rotated(VQ(8, 12, 2)), Rotated(VQ(8, 16, 2)),
-           Rotated(Scalar(2, 128, True)), Rotated(GGML("iq1_s")), Rotated(GGML("iq1_m")), Rotated(Sage(cap=2))]
+           *[Rotated(VQ(8, b)) for b in (2, 3, 5, 7)],
+           *[Rotated(Trellis(V, k, L, R=R)) for V, ks in ((2, range(1, 7)), (4, range(1, 13))) for k in ks
+             for L in (12, 13, 14, 15, 16) for R in (64, 256)],
+           Rotated(Scalar(2, 128, True)), Rotated(GGML("iq1_s")), Rotated(GGML("iq1_m")), Rotated(Sage(cap=2)), Zero()]
 FORMATS = {f.name: f for f in CATALOG}
 
 

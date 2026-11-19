@@ -21,14 +21,17 @@ from . import codecs
 ARCH = "low_bpw_moe"
 
 
-def _codebooks(formats) -> set[tuple[int, int]]:
-    found = set()
+def _codebooks(formats) -> dict[str, torch.Tensor]:
+    """GGUF tensor name -> FP16 codebook / trellis LUT used by `formats` (banks are self-contained)."""
+    found = {}
     for fmt in formats:
         while isinstance(fmt, codecs.Rotated):
             fmt = fmt.inner
         if isinstance(fmt, codecs.VQ):
-            found.add((fmt.dim, fmt.bits))
-    return found
+            found[f"vq.{fmt.dim}x{fmt.bits}"] = codecs.codebook(fmt.dim, fmt.bits, "cpu")
+        if isinstance(fmt, codecs.Trellis):
+            found[f"tcq.{fmt.V}x{fmt.kV}l{fmt.L}"] = codecs.trellis_lut(fmt.V, fmt.kV, fmt.L, "cpu")
+    return dict(sorted(found.items()))
 
 
 def refined(fmt, passes: int):
@@ -65,17 +68,17 @@ def quantize(source, tokens: dict, allocation: Path, output: Path, device: str, 
     writer.add_array(f"{ARCH}.formats", names)
     writer.add_array(f"{ARCH}.assignments", choice.reshape(-1).tolist())
     writer.add_array(f"{ARCH}.format_bytes", sizes.reshape(-1).tolist())  # [projection, format]
-    books = sorted(_codebooks(formats))
-    for dim, bits in books:
-        writer.add_tensor_info(f"vq.{dim}x{bits}", (2 ** bits, dim), np.dtype(np.float16), 2 ** bits * dim * 2)
+    books = _codebooks(formats)
+    for name, book in books.items():
+        writer.add_tensor_info(name, tuple(book.shape), np.dtype(np.float16), book.numel() * 2)
     for layer in range(L):
         writer.add_tensor_info(f"blk.{layer}.routed_experts", (int(offsets[layer, -1]),), np.dtype(np.int8),
                                int(offsets[layer, -1]))
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
     writer.write_ti_data_to_file()
-    for dim, bits in books:
-        writer.write_tensor_data(codecs.codebook(dim, bits, "cpu").half().numpy())
+    for book in books.values():
+        writer.write_tensor_data(book.half().numpy())
     started = monotonic()
 
     def on_layer(stats, layer):
@@ -143,6 +146,11 @@ class ExpertBank:
                 if name.startswith("vq."):
                     dim, bits = map(int, name[3:].split("x"))
                     codecs.CODEBOOKS[(dim, bits)] = torch.from_numpy(np.array(data, dtype=np.float16))
+                if name.startswith("tcq."):
+                    V, rest = name[4:].split("x")
+                    kV, L = map(int, rest.split("l"))
+                    codecs.CODEBOOKS[("tcq", int(V), kV, L)] = torch.from_numpy(
+                        np.array(data, dtype=np.float16)).reshape(1 << L, int(V))
         else:
             raise ValueError(f"unsupported bank version {self.version}")
         for l in self.layers:

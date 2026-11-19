@@ -6,6 +6,8 @@ layer is requested, so a 16 GB GPU can run the full model, a gradient pass, or a
 
 from __future__ import annotations
 
+import os
+
 from typing import Callable
 
 import torch
@@ -142,6 +144,17 @@ def dense_key_map(source: Checkpoint) -> dict[str, str]:
     return mapped
 
 
+DENSE_BITS = int(os.environ.get("LOW_BPW_DENSE_BITS", 0))  # 0 = dense exactly as in the checkpoint
+
+
+def fake_quant(w: torch.Tensor, bits: int, group: int = 32) -> torch.Tensor:
+    """Symmetric RTN, `bits`-bit codes + FP16 scale per `group` inputs (bits + 16/group bpw)."""
+    g = w.float().reshape(-1, group)
+    top = 2 ** (bits - 1) - 1
+    s = (g.abs().amax(1, keepdim=True) / top).half().float().clamp_min(1e-12)
+    return ((g / s).round().clamp(-top - 1, top) * s).reshape(w.shape).to(w.dtype)
+
+
 def load_text_model(source: Checkpoint, device: str, load, *, dense_device: str | None = None,
                     tap=None, grad_tap=None):
     """Dense weights from the checkpoint; routed experts from `load(layer) -> (gate, up, down)` stacks."""
@@ -188,6 +201,9 @@ def load_text_model(source: Checkpoint, device: str, load, *, dense_device: str 
                 else:
                     raise ValueError(f"unsupported FP8 weight scale {scale.shape} for {source_name}")
                 weight = weight.bfloat16()
+            if DENSE_BITS and is_parameter and weight.dim() == 2 and (
+                    dense.tensor(source_name).dtype == torch.float8_e4m3fn or "embed_tokens" in source_name):
+                weight = fake_quant(weight, DENSE_BITS)  # attention (FP8 source) and embeddings
             if weight.shape != param.shape:
                 raise ValueError(f"{source_name}: expected {param.shape}, got {weight.shape}")
             setattr(module, leaf, nn.Parameter(weight, requires_grad=False) if is_parameter else weight)
